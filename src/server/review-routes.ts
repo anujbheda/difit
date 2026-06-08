@@ -1,12 +1,56 @@
-import express, { type Express } from 'express';
+import express, { type Express, type Request, type Response } from 'express';
 
 import { type ReviewSession } from './review-session.js';
 
 export interface ReviewRoutesOptions {
   keepAlive?: boolean;
+  apiBasePath?: string;
 }
 
-export type ReviewSessionProvider = () => ReviewSession;
+export class ReviewRouteError extends Error {
+  constructor(
+    readonly status: number,
+    message: string,
+  ) {
+    super(message);
+  }
+}
+
+export type ReviewSessionProvider = (req: Request) => Promise<ReviewSession> | ReviewSession;
+
+function normalizeApiBasePath(apiBasePath: string | undefined): string {
+  if (apiBasePath === undefined) {
+    return '/api';
+  }
+
+  if (apiBasePath === '' || apiBasePath === '/') {
+    return '';
+  }
+
+  return apiBasePath.endsWith('/') ? apiBasePath.slice(0, -1) : apiBasePath;
+}
+
+function escapeRegExp(value: string): string {
+  return value.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+}
+
+function createRoutePath(apiBasePath: string, path: string): string {
+  return `${apiBasePath}${path}`;
+}
+
+function createSplatRoute(apiBasePath: string, path: string): RegExp {
+  return new RegExp(`^${escapeRegExp(`${apiBasePath}${path}/`)}(.*)$`);
+}
+
+function sendSessionProviderError(res: Response, error: unknown): void {
+  if (error instanceof ReviewRouteError) {
+    res.status(error.status).json({ error: error.message });
+    return;
+  }
+
+  console.error('Error resolving review session:', error);
+  res.status(500).json({ error: 'Failed to resolve review session' });
+}
 
 export function mountReviewRoutes(
   app: Express,
@@ -14,17 +58,35 @@ export function mountReviewRoutes(
   sessionProvider: ReviewSessionProvider,
   options: ReviewRoutesOptions = {},
 ): void {
-  const router = express.Router();
-  const getSession = sessionProvider;
+  const router = express.Router({ mergeParams: true });
+  const apiBasePath = normalizeApiBasePath(options.apiBasePath);
+  const getSession = async (req: Request, res: Response): Promise<ReviewSession | undefined> => {
+    try {
+      return await sessionProvider(req);
+    } catch (error) {
+      sendSessionProviderError(res, error);
+      return undefined;
+    }
+  };
 
-  router.get('/api/diff', async (req, res) => {
-    const diff = await getSession().getDiff(req.query as Record<string, unknown>);
+  router.get(createRoutePath(apiBasePath, '/diff'), async (req, res) => {
+    const session = await getSession(req, res);
+    if (!session) {
+      return;
+    }
+
+    const diff = await session.getDiff(req.query as Record<string, unknown>);
     res.json(diff);
   });
 
-  router.get(/^\/api\/generated-status\/(.*)$/, async (req, res) => {
+  router.get(createSplatRoute(apiBasePath, '/generated-status'), async (req, res) => {
     try {
-      const result = await getSession().getGeneratedStatus(req.params[0], req.query.ref);
+      const session = await getSession(req, res);
+      if (!session) {
+        return;
+      }
+
+      const result = await session.getGeneratedStatus(req.params[0], req.query.ref);
       if (!result.ok) {
         res.status(result.status).json({ error: result.error });
         return;
@@ -37,9 +99,14 @@ export function mountReviewRoutes(
     }
   });
 
-  router.get('/api/revisions', async (_req, res) => {
+  router.get(createRoutePath(apiBasePath, '/revisions'), async (req, res) => {
     try {
-      const result = await getSession().getRevisionOptions();
+      const session = await getSession(req, res);
+      if (!session) {
+        return;
+      }
+
+      const result = await session.getRevisionOptions();
       if (!result.ok) {
         res.status(result.status).json({ error: result.error });
         return;
@@ -52,9 +119,14 @@ export function mountReviewRoutes(
     }
   });
 
-  router.get(/^\/api\/line-count\/(.*)$/, async (req, res) => {
+  router.get(createSplatRoute(apiBasePath, '/line-count'), async (req, res) => {
     try {
-      const result = await getSession().getLineCount(
+      const session = await getSession(req, res);
+      if (!session) {
+        return;
+      }
+
+      const result = await session.getLineCount(
         req.params[0],
         req.query.oldRef as string | undefined,
         req.query.oldPath,
@@ -72,9 +144,14 @@ export function mountReviewRoutes(
     }
   });
 
-  router.get(/^\/api\/blob\/(.*)$/, async (req, res) => {
+  router.get(createSplatRoute(apiBasePath, '/blob'), async (req, res) => {
     try {
-      const result = await getSession().getBlob(req.params[0], req.query.ref);
+      const session = await getSession(req, res);
+      if (!session) {
+        return;
+      }
+
+      const result = await session.getBlob(req.params[0], req.query.ref);
       if (!result.ok) {
         res.status(result.status).json({ error: result.error });
         return;
@@ -91,9 +168,14 @@ export function mountReviewRoutes(
     }
   });
 
-  router.post('/api/comments', (req, res) => {
+  router.post(createRoutePath(apiBasePath, '/comments'), async (req, res) => {
     try {
-      const result = getSession().postComments(req.query as Record<string, unknown>, req.body);
+      const session = await getSession(req, res);
+      if (!session) {
+        return;
+      }
+
+      const result = session.postComments(req.query as Record<string, unknown>, req.body);
       res.json(result);
     } catch (error) {
       console.error('Error parsing comments:', error);
@@ -101,12 +183,14 @@ export function mountReviewRoutes(
     }
   });
 
-  router.post('/api/comment-imports', (req, res) => {
+  router.post(createRoutePath(apiBasePath, '/comment-imports'), async (req, res) => {
     try {
-      const result = getSession().postCommentImports(
-        req.query as Record<string, unknown>,
-        req.body,
-      );
+      const session = await getSession(req, res);
+      if (!session) {
+        return;
+      }
+
+      const result = session.postCommentImports(req.query as Record<string, unknown>, req.body);
       res.json(result);
     } catch (error) {
       console.error('Error parsing comment imports:', error);
@@ -114,17 +198,32 @@ export function mountReviewRoutes(
     }
   });
 
-  router.get('/api/comments-json', (req, res) => {
-    res.json(getSession().getCommentsJson(req.query as Record<string, unknown>));
+  router.get(createRoutePath(apiBasePath, '/comments-json'), async (req, res) => {
+    const session = await getSession(req, res);
+    if (!session) {
+      return;
+    }
+
+    res.json(session.getCommentsJson(req.query as Record<string, unknown>));
   });
 
-  router.get('/api/comments-output', (req, res) => {
+  router.get(createRoutePath(apiBasePath, '/comments-output'), async (req, res) => {
+    const session = await getSession(req, res);
+    if (!session) {
+      return;
+    }
+
     res.type('text/plain');
-    res.send(getSession().getCommentsOutput(req.query as Record<string, unknown>));
+    res.send(session.getCommentsOutput(req.query as Record<string, unknown>));
   });
 
-  router.post('/api/open-in-editor', async (req, res) => {
-    const result = await getSession().openInEditor(req.body);
+  router.post(createRoutePath(apiBasePath, '/open-in-editor'), async (req, res) => {
+    const session = await getSession(req, res);
+    if (!session) {
+      return;
+    }
+
+    const result = await session.openInEditor(req.body);
     if (!result.ok) {
       res.status(result.status).json({ error: result.error });
       return;
@@ -133,7 +232,12 @@ export function mountReviewRoutes(
     res.json(result.value);
   });
 
-  router.get('/api/watch', (req, res) => {
+  router.get(createRoutePath(apiBasePath, '/watch'), async (req, res) => {
+    const session = await getSession(req, res);
+    if (!session) {
+      return;
+    }
+
     res.writeHead(200, {
       'Content-Type': 'text/event-stream',
       'Cache-Control': 'no-cache',
@@ -141,14 +245,19 @@ export function mountReviewRoutes(
       'Access-Control-Allow-Origin': '*',
     });
 
-    getSession().addWatchClient(res);
+    session.addWatchClient(res);
 
     req.on('close', () => {
-      getSession().removeWatchClient(res);
+      session.removeWatchClient(res);
     });
   });
 
-  router.get('/api/heartbeat', (_req, res) => {
+  router.get(createRoutePath(apiBasePath, '/heartbeat'), async (req, res) => {
+    const session = await getSession(req, res);
+    if (!session) {
+      return;
+    }
+
     res.writeHead(200, {
       'Content-Type': 'text/event-stream',
       'Cache-Control': 'no-cache',
@@ -170,8 +279,8 @@ export function mountReviewRoutes(
       } else {
         setTimeout(async () => {
           console.log('Client disconnected, shutting down server...');
-          await getSession().stopFileWatcher();
-          getSession().outputFinalComments();
+          await session.stopFileWatcher();
+          session.outputFinalComments();
           process.exit(0);
         }, 100);
       }

@@ -1,3 +1,8 @@
+import { execFile } from 'child_process';
+import { mkdir, mkdtemp, readFile, rm, writeFile } from 'fs/promises';
+import { tmpdir } from 'os';
+import { join } from 'path';
+
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 
 // Set environment variable to skip fetch mocking
@@ -30,10 +35,34 @@ async function getAvailablePort(preferredPort: number): Promise<number> {
   return port;
 }
 
+async function runGit(cwd: string, args: string[]): Promise<void> {
+  await new Promise<void>((resolve, reject) => {
+    execFile('git', args, { cwd }, (error) => {
+      if (error) {
+        reject(error);
+        return;
+      }
+
+      resolve();
+    });
+  });
+}
+
+async function createTempGitWorktree(parent: string, name: string): Promise<string> {
+  const repoPath = join(parent, name);
+  await mkdir(repoPath, { recursive: true });
+  await runGit(repoPath, ['init']);
+  await writeFile(join(repoPath, 'README.md'), `${name}\n`, 'utf8');
+  return repoPath;
+}
+
 // Mock GitDiffParser
 vi.mock('./git-diff.js', () => {
   class GitDiffParserMock {
-    constructor() {
+    repoPath: string | undefined;
+
+    constructor(repoPath?: string) {
+      this.repoPath = repoPath;
       parserInstances.push(this);
     }
 
@@ -335,6 +364,7 @@ describe('Server Integration Tests', () => {
   });
 
   let servers: any[] = [];
+  let tempDirs: string[] = [];
   let originalProcessExit: any;
 
   beforeEach(() => {
@@ -342,6 +372,7 @@ describe('Server Integration Tests', () => {
     originalProcessExit = process.exit;
     process.exit = vi.fn() as any;
     parserInstances.length = 0;
+    tempDirs = [];
   });
 
   afterEach(async () => {
@@ -357,6 +388,11 @@ describe('Server Integration Tests', () => {
       }
     }
     servers = [];
+
+    for (const tempDir of tempDirs) {
+      await rm(tempDir, { recursive: true, force: true });
+    }
+    tempDirs = [];
   });
 
   describe('Server startup', () => {
@@ -1110,6 +1146,190 @@ describe('Server Integration Tests', () => {
     });
   });
 
+  describe('Hub worktree APIs', () => {
+    async function startHubServer() {
+      const root = await mkdtemp(join(tmpdir(), 'difit-hub-test-'));
+      tempDirs.push(root);
+      const registryPath = join(root, 'worktrees.json');
+      const result = await startServer({
+        hubMode: true,
+        worktreeRegistryPath: registryPath,
+        trustedWorktreeRoots: [root],
+        preferredPort: await getAvailablePort(9100),
+        openBrowser: false,
+      });
+      servers.push(result.server);
+
+      return { root, registryPath, port: result.port };
+    }
+
+    async function registerWorktree(
+      port: number,
+      input: {
+        id: string;
+        path: string;
+        base?: string;
+        target?: string;
+      },
+    ) {
+      const response = await fetch(`http://localhost:${port}/api/worktrees`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(input),
+      });
+
+      expect(response.status).toBe(201);
+      return (await response.json()) as {
+        id: string;
+        path: string;
+        base: string;
+        target: string;
+        missing: boolean;
+      };
+    }
+
+    it('registers and persists multiple trusted git worktrees', async () => {
+      const { root, registryPath, port } = await startHubServer();
+      const first = await createTempGitWorktree(root, 'first');
+      const second = await createTempGitWorktree(root, 'second');
+
+      await registerWorktree(port, {
+        id: 'first-worktree',
+        path: first,
+        base: 'main',
+        target: 'feature',
+      });
+      await registerWorktree(port, {
+        id: 'second_worktree',
+        path: second,
+        base: 'origin/main',
+        target: '.',
+      });
+
+      const response = await fetch(`http://localhost:${port}/api/worktrees`);
+      const data = (await response.json()) as {
+        worktrees: Array<{ id: string; missing: boolean }>;
+      };
+      expect(response.ok).toBe(true);
+      expect(data.worktrees).toEqual(
+        expect.arrayContaining([
+          expect.objectContaining({ id: 'first-worktree', missing: false }),
+          expect.objectContaining({ id: 'second_worktree', missing: false }),
+        ]),
+      );
+
+      const persisted = JSON.parse(await readFile(registryPath, 'utf8')) as {
+        worktrees: Array<{ id: string }>;
+      };
+      expect(persisted.worktrees.map((worktree) => worktree.id)).toEqual([
+        'first-worktree',
+        'second_worktree',
+      ]);
+    });
+
+    it('serves isolated scoped diffs for each registered worktree', async () => {
+      const { root, port } = await startHubServer();
+      const first = await createTempGitWorktree(root, 'first');
+      const second = await createTempGitWorktree(root, 'second');
+
+      await registerWorktree(port, {
+        id: 'first',
+        path: first,
+        base: 'main',
+        target: 'feature-a',
+      });
+      await registerWorktree(port, {
+        id: 'second',
+        path: second,
+        base: 'main',
+        target: 'feature-b',
+      });
+
+      const firstResponse = await fetch(`http://localhost:${port}/api/worktrees/first/diff`);
+      const firstDiff = (await firstResponse.json()) as { repositoryId: string };
+      const secondResponse = await fetch(`http://localhost:${port}/api/worktrees/second/diff`);
+      const secondDiff = (await secondResponse.json()) as { repositoryId: string };
+
+      expect(firstResponse.ok).toBe(true);
+      expect(secondResponse.ok).toBe(true);
+      expect(firstDiff.repositoryId).not.toBe(secondDiff.repositoryId);
+      expect(parserInstances.at(-2)?.repoPath).toBe(first);
+      expect(parserInstances.at(-1)?.repoPath).toBe(second);
+    });
+
+    it('publishes scoped worktree summary fields', async () => {
+      const { root, port } = await startHubServer();
+      const worktreePath = await createTempGitWorktree(root, 'publish');
+      await registerWorktree(port, {
+        id: 'publish-target',
+        path: worktreePath,
+        base: 'origin/main',
+        target: 'feature',
+      });
+
+      const response = await fetch(
+        `http://localhost:${port}/api/worktrees/publish-target/publish`,
+        {
+          method: 'POST',
+        },
+      );
+      const data = (await response.json()) as {
+        id: string;
+        url: string;
+        localUrl: string;
+        isEmpty: boolean;
+        filesChanged: number;
+        base: string;
+        target: string;
+      };
+
+      expect(response.ok).toBe(true);
+      expect(data).toEqual({
+        id: 'publish-target',
+        url: `http://localhost:${port}/worktrees/publish-target`,
+        localUrl: `http://localhost:${port}/worktrees/publish-target`,
+        isEmpty: false,
+        filesChanged: 1,
+        base: 'origin/main',
+        target: 'feature',
+      });
+    });
+
+    it('reports missing registered paths without crashing scoped APIs', async () => {
+      const { root, port } = await startHubServer();
+      const worktreePath = await createTempGitWorktree(root, 'missing');
+      await registerWorktree(port, {
+        id: 'missing-target',
+        path: worktreePath,
+        base: 'main',
+        target: 'feature',
+      });
+      await rm(worktreePath, { recursive: true, force: true });
+
+      const getResponse = await fetch(`http://localhost:${port}/api/worktrees/missing-target`);
+      const worktree = (await getResponse.json()) as { missing: boolean };
+      expect(getResponse.ok).toBe(true);
+      expect(worktree.missing).toBe(true);
+
+      const diffResponse = await fetch(
+        `http://localhost:${port}/api/worktrees/missing-target/diff`,
+      );
+      const diffError = (await diffResponse.json()) as { error: string };
+      expect(diffResponse.status).toBe(404);
+      expect(diffError.error).toBe('Registered worktree path is missing');
+    });
+
+    it('returns a helpful error for unscoped review APIs in hub mode', async () => {
+      const { port } = await startHubServer();
+
+      const response = await fetch(`http://localhost:${port}/api/diff`);
+      const data = (await response.json()) as { error: string };
+
+      expect(response.status).toBe(400);
+      expect(data.error).toBe('Hub mode requires scoped review APIs. Use /api/worktrees/:id/diff.');
+    });
+  });
+
   describe('Static file serving', () => {
     let originalNodeEnv: string | undefined;
 
@@ -1239,7 +1459,7 @@ describe('Server Integration Tests', () => {
 
       expect(response.headers.get('Access-Control-Allow-Origin')).toBe('http://localhost:*');
       expect(response.headers.get('Access-Control-Allow-Methods')).toBe(
-        'GET, POST, PUT, DELETE, OPTIONS',
+        'GET, POST, PATCH, PUT, DELETE, OPTIONS',
       );
       expect(response.headers.get('Access-Control-Allow-Headers')).toBe(
         'Origin, X-Requested-With, Content-Type, Accept',
